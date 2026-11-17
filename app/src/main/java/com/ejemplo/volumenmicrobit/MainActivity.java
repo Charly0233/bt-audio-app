@@ -8,6 +8,7 @@ import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
 import android.bluetooth.BluetoothGattCallback;
 import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
@@ -42,6 +43,8 @@ public class MainActivity extends Activity {
     private static final UUID UART_CHAR_A = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
     private static final UUID UART_CHAR_B = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
 
+    private static final UUID CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
+
     private static final int REQ_PERMISOS = 1;
     private static final long TIEMPO_BUSQUEDA_MS = 10000;
     private static final long INTERVALO_LECTURA_MS = 200;
@@ -53,6 +56,7 @@ public class MainActivity extends Activity {
     private BluetoothLeScanner scanner;
     private BluetoothGatt gatt;
     private BluetoothGattCharacteristic caracteristicaEscritura;
+    private BluetoothGattCharacteristic caracteristicaPendiente;
 
     private boolean buscando = false;
     private boolean escribiendo = false;
@@ -259,6 +263,7 @@ public class MainActivity extends Activity {
 
     private void desconectar() {
         caracteristicaEscritura = null;
+        caracteristicaPendiente = null;
         if (gatt != null) {
             gatt.disconnect();
             gatt.close();
@@ -285,23 +290,43 @@ public class MainActivity extends Activity {
         public void onServicesDiscovered(BluetoothGatt g, int status) {
             BluetoothGattService servicio = g.getService(UART_SERVICE);
             BluetoothGattCharacteristic c = null;
+            BluetoothGattCharacteristic r = null;
             if (servicio != null) {
                 c = escribible(servicio.getCharacteristic(UART_CHAR_A));
                 if (c == null) c = escribible(servicio.getCharacteristic(UART_CHAR_B));
+                r = avisable(servicio.getCharacteristic(UART_CHAR_B));
+                if (r == null) r = avisable(servicio.getCharacteristic(UART_CHAR_A));
             }
-            final BluetoothGattCharacteristic encontrada = c;
-            runOnUiThread(() -> {
-                if (encontrada == null) {
+            if (c == null) {
+                runOnUiThread(() -> {
                     estado("La micro:bit no tiene el servicio UART.\nCarga el programa de MakeCode.");
                     desconectar();
-                    return;
-                }
-                caracteristicaEscritura = encontrada;
-                ultimoEnviado = -1; // fuerza un envío inmediato
-                estado("Conectado ✔");
-                botonConectar.setText("Desconectar");
-                botonConectar.setEnabled(true);
-            });
+                });
+                return;
+            }
+            caracteristicaPendiente = c;
+            // Activa la recepción de mensajes de la micro:bit (indicaciones)
+            if (r != null && activarAvisos(g, r)) {
+                return; // se termina de conectar en onDescriptorWrite
+            }
+            runOnUiThread(() -> listo());
+        }
+
+        @Override
+        public void onDescriptorWrite(BluetoothGatt g, BluetoothGattDescriptor d, int status) {
+            runOnUiThread(() -> listo());
+        }
+
+        // Android 13 o más nuevo
+        @Override
+        public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic c, byte[] value) {
+            recibido(value);
+        }
+
+        // Android 12 o anterior
+        @Override
+        public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic c) {
+            if (Build.VERSION.SDK_INT < 33) recibido(c.getValue());
         }
 
         @Override
@@ -312,6 +337,52 @@ public class MainActivity extends Activity {
             });
         }
     };
+
+    private void listo() {
+        if (gatt == null || caracteristicaPendiente == null) return;
+        caracteristicaEscritura = caracteristicaPendiente;
+        caracteristicaPendiente = null;
+        escribiendo = false;
+        ultimoEnviado = -1; // fuerza un envío inmediato
+        estado("Conectado ✔");
+        botonConectar.setText("Desconectar");
+        botonConectar.setEnabled(true);
+    }
+
+    private boolean activarAvisos(BluetoothGatt g, BluetoothGattCharacteristic r) {
+        BluetoothGattDescriptor d = r.getDescriptor(CCCD);
+        if (d == null || !g.setCharacteristicNotification(r, true)) return false;
+        boolean indica = (r.getProperties() & BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0;
+        d.setValue(indica ? BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                : BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+        return g.writeDescriptor(d);
+    }
+
+    /** Mensajes de la micro:bit: "-" baja el volumen, "+" lo sube. */
+    private void recibido(byte[] datos) {
+        if (datos == null) return;
+        String texto = new String(datos, StandardCharsets.US_ASCII);
+        runOnUiThread(() -> {
+            for (char ch : texto.toCharArray()) {
+                if (ch == '-') {
+                    audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC,
+                            AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI);
+                } else if (ch == '+') {
+                    audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC,
+                            AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI);
+                }
+            }
+            // El nuevo volumen se le manda solo a la micro:bit en la siguiente lectura
+        });
+    }
+
+    private static BluetoothGattCharacteristic avisable(BluetoothGattCharacteristic c) {
+        if (c == null) return null;
+        int props = c.getProperties();
+        boolean ok = (props & (BluetoothGattCharacteristic.PROPERTY_INDICATE
+                | BluetoothGattCharacteristic.PROPERTY_NOTIFY)) != 0;
+        return ok ? c : null;
+    }
 
     private static BluetoothGattCharacteristic escribible(BluetoothGattCharacteristic c) {
         if (c == null) return null;
